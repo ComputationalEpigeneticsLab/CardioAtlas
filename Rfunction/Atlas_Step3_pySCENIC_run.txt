@@ -1,0 +1,206 @@
+# Step3 Running pySCENIC
+
+###################### Load packages (R)######################
+rm(list = ls())
+gc()
+library(Seurat)
+library(dplyr)
+library(SCENIC)
+library(SCopeLoomR)
+library(hdf5r)
+library(loomR)
+
+###################### Work path (R)######################
+atsID = "atlas_human_adult_normal"
+innerpath = paste0("/data/Subject/heartscRNAseq/innerpath/")
+pyscenic_path = paste0("/data/Subject/heartscRNAseq/atlas/",atsID,'/pyscenic')
+if(!dir.exists(pyscenic_workpath)){      dir.create(pyscenic_workpath)    }
+dir_out = paste0("/data/Subject/heartscRNAseq/atlas/",atsID,"/result/")
+dir_web = paste0("/data/Subject/heartscRNAseq/atlas/",atsID,"/result/1_web/")
+file_web = paste0("/data/Subject/heartscRNAseq/CardioAtlasWebFiles/")
+setwd(pyscenic_workpath)
+
+###################### 1.Load data (R)######################
+human_adult_atlas_use = readRDS(paste0(dir_out,'atlas_human_adult_normal.rds'))
+
+count = as.data.frame(human_adult_atlas_use@assays$SCT@counts)
+metad = as.data.frame(human_adult_atlas_use@meta.data)
+
+celltype_all = unique(metad$cell_type)
+celltype_all = celltype_all[celltype_all != "Unknown"]
+
+if(!dir.exists("count_celltype")){      dir.create("count_celltype")    }
+if(!dir.exists("loom")){      dir.create("loom")    }
+for(i in 1:length(celltype_all)){
+  cell0 = celltype_all[i]
+  print(cell0)
+  metad_cell0 = metad[which(metad$cell_type == cell0),]
+  print(dim(metad_cell0))
+  count_cell0 = count[,rownames(metad_cell0)]
+  write.csv(count_cell0,paste0("count_celltype/",cell0,"_count.csv"),quote = F)
+}
+
+###################### 2.prepare for pySCENIC (python and Linux)######################
+
+"""
+# python
+import os, sys;
+atsID="atlas_human_adult_normal"
+os.chdir("/data/Subject/heartscRNAseq/atlas/"+atsID+"/pyscenic/count_celltype");
+filen = os.listdir(os.getcwd()) ;
+filen = [x for x in filen if x.endswith("csv")];
+import loompy as lp;import numpy as np;import scanpy as sc;
+for i in filen:
+  x = sc.read_csv(i)
+  row_attrs = {"Gene": np.array(x.obs_names),}
+  col_attrs = {"CellID": np.array(x.var_names)}
+  lp.create("../loom/"+i+".loom",x.X,row_attrs,col_attrs)
+
+"""
+
+"""
+# Linux
+work_path = "/data/Subject/heartscRNAseq/atlas/atlas_human_adult_normal/pyscenic"
+cd $work_path
+## STEP 1/3: Gene regulatory network inference, and generation of co-expression modules
+mkdir result_grn
+ls loom/ |xargs -I {} echo pyscenic grn --num_workers 10 --output result_grn/adj.{}.tsv --method grnboost2 loom/{} /data/Subject/heartscRNAseq/database/hs_hgnc_tfs.txt >> pyscenic_grn.sh
+
+## STEP 2/3: Regulon prediction (cisTarget)
+mkdir result_ctx
+ls loom/ |xargs -I {} echo pyscenic ctx result_grn/adj.{}.tsv /data/Subject/heartscRNAseq/database/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather --annotations_fname /data/Subject/heartscRNAseq/database/motifs-v10-nr.hgnc-m0.00001-o0.0.tbl --expression_mtx_fname loom/{} --mode "dask_multiprocessing" --output result_ctx/reg_{}.csv --num_workers 20 --mask_dropouts >> pyscenic_ctx.sh
+
+## STEP 3/3: Cellular enrichment (AUCell)
+mkdir result_aucell
+ls loom/ |xargs -I {} echo pyscenic aucell loom/{} result_ctx/reg_{}.csv --output result_aucell/{} --num_workers 10  >> pyscenic_aucell.sh
+
+"""
+
+###################### 3.Running pySCENIC (Linux)######################
+
+"""
+Linux
+work_path = "/data/Subject/heartscRNAseq/atlas/atlas_human_adult_normal/pyscenic"
+cd $work_path
+## Running
+sh pyscenic_grn.sh
+sh pyscenic_ctx.sh
+sh pyscenic_aucell.sh
+"""
+
+###################### 4.Processing result data of pySCENIC (R)######################
+setwd(pyscenic_workpath)
+fileloom = dir("result_aucell")
+dir.create("result_aucell2")
+regulons_all = data.frame()
+regulonAUC_all = data.frame()
+regulons_filter_all = c()
+
+i = 1
+scenicLoomPath = paste0("result_aucell/",fileloom[i])
+loom = open_loom(scenicLoomPath) ## load result
+## Read information from loom file: 
+regulons_incidMat = get_regulons(loom, column.attr.name = "Regulons")
+regulons = regulonsToGeneLists(regulons_incidMat)
+regulonAUC = get_regulons_AUC(loom, column.attr.name = "RegulonsAUC") 
+### targets of TF
+regulons_2 = as.matrix(regulons)
+regulons_2 = do.call(rbind, regulons)
+regulons_3 = reshape2::melt(regulons_2)
+regulons_3 = regulons_3[,c(1,3)]
+regulons_4 = regulons_3 %>% distinct()
+celltypen = gsub("_count.csv.loom","",fileloom[i])
+regulons_4$CellType = celltypen
+colnames(regulons_4) = c("TF","target","CellType")
+
+stat = regulons_4 %>% group_by(TF,CellType) %>% summarise(target_n = n())
+stat = as.data.frame(stat)
+stat$target_n = paste0(stat$target_n,"g")
+stat$TF_tn = apply(stat,1,function(v){
+  tf = as.character(v[1])
+  tf = gsub("\\(\\+\\)","",tf)
+  target_n = v[3]
+  tf_tn = paste0(tf,"(",target_n,")")
+  return(tf_tn)
+})
+
+regulons_5 = merge(regulons_4,stat,by = c("TF","CellType"),sort = F)
+regulons_5 = regulons_5[,c("TF_tn","CellType","target")]
+colnames(regulons_5)[1] = "TF"
+
+### AUC of TF
+regulonAUC_all = as.data.frame(regulonAUC@assays@data@listData,check.names = F)
+colnames(regulonAUC_all) = gsub("AUC\\.","",colnames(regulonAUC_all))
+regulonAUC_all$regulons = rownames(regulonAUC_all)
+regulonAUC_all = merge(regulonAUC_all,stat,by.x = c("regulons"),by.y = c("TF"),sort = F)
+rownames(regulonAUC_all) = regulonAUC_all$TF_tn
+regulonAUC_all = regulonAUC_all %>% select(-regulons,-CellType,-target_n,-TF_tn)
+regulonAUC_all$regulons = rownames(regulonAUC_all)
+
+regulons_filter = names(which(apply(regulonAUC_all,1,function(v){all(v == 0)})))
+regulons_filter_all = c(regulons_filter_all,regulons_filter)
+
+regulons_all = rbind(regulons_all,regulons_5)
+
+for(i in 2:length(fileloom)){
+  scenicLoomPath = paste0("result_aucell/",fileloom[i])
+  loom = open_loom(scenicLoomPath)
+  
+  regulons_incidMat = get_regulons(loom, column.attr.name = "Regulons")
+  regulons = regulonsToGeneLists(regulons_incidMat)
+  regulonAUC = get_regulons_AUC(loom, column.attr.name = "RegulonsAUC") 
+  
+  regulons_2 = as.matrix(regulons)
+  regulons_2 = do.call(rbind, regulons)
+  regulons_3 = reshape2::melt(regulons_2)
+  regulons_3 = regulons_3[,c(1,3)]
+  regulons_4 = regulons_3 %>% distinct()
+  celltypen = gsub("_count.csv.loom","",fileloom[i])
+  regulons_4$CellType = celltypen
+  colnames(regulons_4) = c("TF","target","CellType")
+  
+  stat = regulons_4 %>% group_by(TF,CellType) %>% summarise(target_n = n())
+  stat = as.data.frame(stat)
+  stat$target_n = paste0(stat$target_n,"g")
+  stat$TF_tn = apply(stat,1,function(v){
+    tf = as.character(v[1])
+    tf = gsub("\\(\\+\\)","",tf)
+    target_n = v[3]
+    tf_tn = paste0(tf,"(",target_n,")")
+    return(tf_tn)
+  })
+  
+  regulons_5 = merge(regulons_4,stat,by = c("TF","CellType"),sort = F)
+  regulons_5 = regulons_5[,c("TF_tn","CellType","target")]
+  colnames(regulons_5)[1] = "TF"
+  
+  regulonAUC_2 = as.data.frame(regulonAUC@assays@data@listData,check.names = F)
+  colnames(regulonAUC_2) = gsub("AUC\\.","",colnames(regulonAUC_2))
+  regulonAUC_2$regulons = rownames(regulonAUC_2)
+  regulonAUC_3 = merge(regulonAUC_2,stat,by.x = c("regulons"),by.y = c("TF"),sort = F)
+  rownames(regulonAUC_3) = regulonAUC_3$TF_tn
+  regulonAUC_3 = regulonAUC_3 %>% select(-regulons,-CellType,-target_n,-TF_tn)
+  regulonAUC_3$regulons = rownames(regulonAUC_3)
+  
+  regulons_filter = names(which(apply(regulonAUC_3,1,function(v){all(v == 0)})))
+  regulons_filter_all = c(regulons_filter_all,regulons_filter)
+  
+  regulonAUC_all = merge(regulonAUC_all,regulonAUC_3,by = "regulons",all = T)
+  regulons_all = rbind(regulons_all,regulons_5)
+  
+}
+
+write.csv(regulons_all,paste0("result_aucell2/regulons_all.csv"),row.names = F,quote = F)
+
+rownames(regulonAUC_all) = regulonAUC_all$regulons
+regulonAUC_all2 = regulonAUC_all[,-1]
+regulonAUC_all3 = regulonAUC_all2
+regulonAUC_all3[is.na(regulonAUC_all3)] = 0
+regulons_filter = names(which(apply(regulonAUC_all3,1,function(v){all(v == 0)})))
+write.csv(regulonAUC_all2,paste0("result_aucell2/regulonAUC_all.csv"),quote = F)
+
+
+
+
+
+
