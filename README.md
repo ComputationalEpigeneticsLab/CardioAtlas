@@ -7,5 +7,5 @@ Increasing scRNA-seq data in cardiovascular research have substantially improved
 ## Pipeline
 ![](https://github.com/ComputationalEpigeneticsLab/CardioAtlas/blob/main/image/Figure-workflow.jpg)
 
-## WebServer
+## Database
 CardioAtlas is freely accessible at : http://bio-bigdata.hrbmu.edu.cn/CardioAtlas/
